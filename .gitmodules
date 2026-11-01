@@ -1,0 +1,3 @@
+[submodule "extern/HotSpot"]
+	path = extern/HotSpot
+	url = https://github.com/uvahotspot/HotSpot.git
