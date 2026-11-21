@@ -242,7 +242,345 @@ def infer_mapping(
     return mapping, t_max
 
 
+import csv
+import time
+
+import numpy as np
+
+
+def eval_random_and_greedy(
+    flp, lcf_path, flp_path, workloads, hotspot_bin, config_path=None, n_rand=20, seed=0
+):
+    rng = np.random.default_rng(seed)
+    core_names = flp["core_names"]
+    core_types = flp["core_types"]
+    fixed_blocks = flp["fixed_blocks"]
+    N = len(core_names)
+
+    # 1. Random baseline (mean & best of n_rand)
+    rand_temps = []
+    for _ in range(n_rand):
+        perm = rng.permutation(N)
+        bp = dict(fixed_blocks)
+        for wl_i, c_i in enumerate(perm):
+            bp[core_names[c_i]] = float(workloads[wl_i, core_types[c_i]])
+        rand_temps.append(
+            run_hotspot_steady(hotspot_bin, config_path, flp_path, lcf_path, bp)
+        )
+
+    # 2. Greedy heuristic: largest (P_P - P_E) workloads -> E-cores first
+    e_cores = [i for i, t in enumerate(core_types) if t == 0]
+    p_cores = [i for i, t in enumerate(core_types) if t == 1]
+    order = np.argsort(-(workloads[:, 1] - workloads[:, 0]))
+    bp_greedy = dict(fixed_blocks)
+    for wl_i, core_i in zip(order, e_cores + p_cores):
+        bp_greedy[core_names[core_i]] = float(workloads[wl_i, core_types[core_i]])
+    greedy_t = run_hotspot_steady(
+        hotspot_bin, config_path, flp_path, lcf_path, bp_greedy
+    )
+
+    return float(np.mean(rand_temps)), float(np.min(rand_temps)), greedy_t
+
+
+def run_benchmark(
+    ckpt_path,
+    floorplan_specs,
+    workload_bank,
+    hotspot_bin="./extern/HotSpot/hotspot",
+    n_seeds=5,
+):
+    rng = np.random.default_rng(123)
+    rows = []
+
+    for flp_path, lcf_path in floorplan_specs:
+        flp = parse_flp(
+            flp_path, p_prefixes=("core_0_", "core_1_"), e_prefixes=("core_",)
+        )
+        n = len(flp["core_names"])
+        bank = np.asarray(workload_bank, dtype=np.float32)
+
+        rl_list, rand_mean_list, rand_min_list, greedy_list, ms_list = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        for s in range(n_seeds):
+            idxs = rng.choice(len(bank), size=n, replace=True)
+            wl = bank[idxs]
+
+            t0 = time.perf_counter()
+            _, rl_t = infer_mapping(
+                ckpt_path, flp_path, lcf_path, wl, hotspot_bin=hotspot_bin
+            )
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+
+            r_mean, r_min, g_t = eval_random_and_greedy(
+                flp, lcf_path, flp_path, wl, hotspot_bin, n_rand=20, seed=s
+            )
+            rl_list.append(rl_t)
+            rand_mean_list.append(r_mean)
+            rand_min_list.append(r_min)
+            greedy_list.append(g_t)
+            ms_list.append(dt_ms)
+
+        row = {
+            "flp": flp_path.split("/")[-1],
+            "cores": n,
+            "rand_mean": np.mean(rand_mean_list),
+            "rand_min": np.mean(rand_min_list),
+            "greedy": np.mean(greedy_list),
+            "rl": np.mean(rl_list),
+            "gain_vs_rand": np.mean(rand_mean_list) - np.mean(rl_list),
+            "gain_vs_greedy": np.mean(greedy_list) - np.mean(rl_list),
+        }
+        rows.append(row)
+        print(
+            f"{row['flp']:20s} | N={n:2d} | Rand={row['rand_mean']:.2f} K | "
+            f"Greedy={row['greedy']:.2f} K | RL={row['rl']:.2f} K | "
+            f"Gain vs Rand={row['gain_vs_rand']:+.2f} K | vs Greedy={row['gain_vs_greedy']:+.2f} K"
+        )
+
+    with open("results.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+WORKLOAD_BANK = [
+    # Light / Idle / Memory-bound (low P-core penalty)
+    [0.35, 0.90],  # Idle / background daemon
+    [0.55, 1.45],  # Pointer-chasing / memory-bound
+    [0.75, 2.10],  # Streaming I/O / cache-miss heavy
+    [0.95, 2.80],  # Lightweight web / event loop
+    [1.15, 3.50],  # Light compression (zstd -1)
+    [1.30, 4.10],  # Database lookup / B-tree scan
+    # Moderate / Mixed integer & branch-heavy
+    [1.55, 5.00],  # Compiler frontend / parsing
+    [1.80, 5.90],  # JSON/protobuf serialization
+    [2.05, 6.85],  # Integer sorting / graph traversal
+    [2.25, 7.60],  # WebAssembly / JS JIT workload
+    [2.50, 8.50],  # Video decode (mixed scalar/SIMD)
+    [2.75, 9.40],  # Encryption / AES-GCM stream
+    # Compute-intensive (moderate-high P-core spike)
+    [3.00, 10.60],  # Sparse linear algebra
+    [3.20, 11.50],  # Physics / collision step
+    [3.45, 12.60],  # Ray-tracing / BVH traversal
+    [3.65, 13.80],  # High-ratio compression (xz)
+    [3.90, 14.90],  # Audio/video encode (x265)
+    [4.10, 16.00],  # ML inference (INT8 GEMM)
+    # Heavy FP / SIMD / Thermal-stress (steepest P-core spike)
+    [4.30, 17.20],  # Dense FP32 matrix multiply
+    [4.50, 18.40],  # FFT / signal processing
+    [4.70, 19.60],  # Molecular dynamics / stencil
+    [4.90, 20.80],  # Monte Carlo simulation
+    [5.10, 22.00],  # AVX2/AVX-512 GEMM kernel
+    [5.35, 23.50],  # Prime / cryptographic stress
+]
+
+
+def run_all_tests(
+    ckpt_path,
+    floorplan_specs,
+    workload_bank,
+    hotspot_bin="./extern/HotSpot/hotspot",
+    n_seeds=5,
+):
+    rng = np.random.default_rng(123)
+    bank = np.asarray(workload_bank, dtype=np.float32)
+    bank_sorted = bank[np.argsort(bank[:, 1])]  # sorted cool -> hot
+
+    all_rows = []
+
+    for flp_path, lcf_path in floorplan_specs:
+        flp = parse_flp(
+            flp_path, p_prefixes=("core_0_", "core_1_"), e_prefixes=("core_",)
+        )
+        n = len(flp["core_names"])
+        flp_name = "/".join(flp_path.split("/")[-2:])  # e.g. fp_001/fp_001_layer_0.flp
+
+        # Build 4 distinct test suites for this floorplan
+        suites = {
+            "mixed": [
+                bank[rng.choice(len(bank), size=n, replace=True)]
+                for _ in range(n_seeds)
+            ],
+            "skewed": [
+                np.vstack(
+                    [
+                        bank_sorted[-max(2, n // 4) :][
+                            rng.choice(
+                                max(2, n // 4), size=max(2, n // 4), replace=True
+                            )
+                        ],
+                        bank_sorted[: len(bank_sorted) // 2][
+                            rng.choice(
+                                len(bank_sorted) // 2,
+                                size=n - max(2, n // 4),
+                                replace=True,
+                            )
+                        ],
+                    ]
+                )[rng.permutation(n)]
+                for _ in range(n_seeds)
+            ],
+            "heavy_stress": [
+                bank_sorted[len(bank_sorted) // 2 :][
+                    rng.choice(
+                        len(bank_sorted) - len(bank_sorted) // 2, size=n, replace=True
+                    )
+                ]
+                for _ in range(n_seeds)
+            ],
+        }
+        # Suite 4: fixed workload set in 5 different arrival orders
+        base_wl = bank[rng.choice(len(bank), size=n, replace=True)]
+        suites["order_invariance"] = [
+            base_wl[rng.permutation(n)] for _ in range(n_seeds)
+        ]
+
+        for suite_name, wl_list in suites.items():
+            rl_t, rand_mean_t, rand_min_t, greedy_t, ms_t = [], [], [], [], []
+            for s, wl in enumerate(wl_list):
+                t0 = time.perf_counter()
+                _, t_rl = infer_mapping(
+                    ckpt_path, flp_path, lcf_path, wl, hotspot_bin=hotspot_bin
+                )
+                ms_t.append((time.perf_counter() - t0) * 1000.0)
+
+                r_mean, r_min, g_t = eval_random_and_greedy(
+                    flp, lcf_path, flp_path, wl, hotspot_bin, n_rand=20, seed=s
+                )
+                rl_t.append(t_rl)
+                rand_mean_t.append(r_mean)
+                rand_min_t.append(r_min)
+                greedy_t.append(g_t)
+
+            row = {
+                "flp": flp_name,
+                "suite": suite_name,
+                "cores": n,
+                "rand_mean": np.mean(rand_mean_t),
+                "rand_min": np.mean(rand_min_t),
+                "greedy": np.mean(greedy_t),
+                "rl_mean": np.mean(rl_t),
+                "rl_std": np.std(rl_t),
+                "gain_vs_rand": np.mean(rand_mean_t) - np.mean(rl_t),
+                "gain_vs_greedy": np.mean(greedy_t) - np.mean(rl_t),
+                "infer_ms": np.mean(ms_t),
+            }
+            all_rows.append(row)
+            print(
+                f"{flp_name:28s} | {suite_name:16s} | Rand={row['rand_mean']:.2f} K | "
+                f"Greedy={row['greedy']:.2f} K | RL={row['rl_mean']:.2f}±{row['rl_std']:.2f} K | "
+                f"Gain(Rand)={row['gain_vs_rand']:+.2f} K | Gain(Greedy)={row['gain_vs_greedy']:+.2f} K"
+            )
+
+    with open("all_test_results.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=all_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(all_rows)
+    print("\nSaved all results to all_test_results.csv")
+
+
+floorplan_specs = [
+    (
+        "Sample_dataset/2D_floorplans/Style_1/fp_001/fp_001_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_1/fp_001/fp_001.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_1/fp_002/fp_002_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_1/fp_002/fp_002.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_1/fp_003/fp_003_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_1/fp_003/fp_003.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_2/fp_001/fp_001_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_2/fp_001/fp_001.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_2/fp_002/fp_002_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_2/fp_002/fp_002.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_2/fp_003/fp_003_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_2/fp_003/fp_003.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_2/fp_004/fp_004_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_2/fp_004/fp_004.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_2/fp_005/fp_005_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_2/fp_005/fp_005.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_3/fp_001/fp_001_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_3/fp_001/fp_001.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_3/fp_002/fp_002_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_3/fp_002/fp_002.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_3/fp_003/fp_003_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_3/fp_003/fp_003.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_3/fp_004/fp_004_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_3/fp_004/fp_004.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_3/fp_005/fp_005_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_3/fp_005/fp_005.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_4/fp_001/fp_001_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_4/fp_001/fp_001.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_4/fp_002/fp_002_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_4/fp_002/fp_002.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_4/fp_003/fp_003_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_4/fp_003/fp_003.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_4/fp_004/fp_004_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_4/fp_004/fp_004.lcf",
+    ),
+    (
+        "Sample_dataset/2D_floorplans/Style_4/fp_005/fp_005_layer_0.flp",
+        "Sample_dataset/2D_floorplans/Style_4/fp_005/fp_005.lcf",
+    ),
+]
+
 if __name__ == "__main__":
+    run_all_tests(
+        ckpt_path="best_hotspot_mapper.pt",
+        floorplan_specs=floorplan_specs,
+        workload_bank=WORKLOAD_BANK,
+        hotspot_bin="./extern/HotSpot/hotspot",
+        n_seeds=5,
+    )
+    # run_benchmark(
+    #     ckpt_path="best_hotspot_mapper.pt",
+    #     floorplan_specs=[
+    #         (
+    #             "Sample_dataset/2D_floorplans/Style_1/fp_001/fp_001_layer_0.flp",
+    #             "Sample_dataset/2D_floorplans/Style_1/fp_001/fp_001.lcf",
+    #         ),
+    #     ],
+    #     workload_bank=WORKLOAD_BANK,
+    #     hotspot_bin="./extern/HotSpot/hotspot",
+    #     n_seeds=10,
+    # )
+
+if __name__ != "__main__":
     # Example usage on one floorplan
     flp_path = "Sample_dataset/2D_floorplans/Style_3/fp_001/fp_001_layer_0.flp"
     lcf_path = "Sample_dataset/2D_floorplans/Style_3/fp_001/fp_001.lcf"
